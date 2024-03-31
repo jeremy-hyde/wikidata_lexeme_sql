@@ -1,3 +1,4 @@
+import time
 import logging
 import sqlite3
 from typing import Dict
@@ -8,10 +9,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def main(input_filepath: str, output_file: str):
+def main(input_filepath: str, input_properties: str, output_file: str):
     logger.info("Init Database")
     con = init_database(output_file)
-    logger.info("Open File")
+    # Init Json Decoder
+    decoder = msgspec.json.Decoder()
+
+    logger.info("Open Properties File")
+    with open(input_properties, mode="r") as file:
+        line = file.readline()
+        parse_properties(con, decoder, line)
+
+    logger.info("Open Lexeme File")
     with open(input_filepath, mode="r") as file:
         for n, line in enumerate(file, start=1):
             if line.strip() in ("[", "]"):
@@ -19,8 +28,8 @@ def main(input_filepath: str, output_file: str):
                 logger.debug("Skip line {}".format(n))
                 continue
 
-            logger.info("Parse line {}".format(n))
-            parse_line(con, n, line)
+            # logger.info("Parse line {}".format(n))
+            parse_lexeme_line(con, decoder, n, line)
 
             if n % 100000 == 0:
                 logger.info(f"Line: {n}")
@@ -37,40 +46,81 @@ def init_database(output_file: str):
     """
     con = sqlite3.connect(output_file)
     cur = con.cursor()
+
+    # Properties used to describe claims
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS properties(property_id, label, description,
+        CONSTRAINT pk_properties PRIMARY KEY (property_id))
+        """
+    )
+
     cur.execute(
         "CREATE TABLE IF NOT EXISTS lexeme(lexeme_id, title, pageid, ns, type, lexicalCategory, language, lastrevid, modified)"
     )
 
     # Lemma represent the lexeme word
     cur.execute("CREATE TABLE IF NOT EXISTS lemmas(lexeme_id, language, value)")
-    # Forms are the forms the word can take. Each form is described with grammaticalFeatures like: singular, plurial, feminine, etc
+
+    # Forms are the forms the word can take.
+    # Each form is described with grammaticalFeatures like: singular, plural, feminine, etc
     cur.execute(
-        "CREATE TABLE IF NOT EXISTS forms(form_id, lexeme_id, language, value, grammaticalFeatures)"
+        """
+        CREATE TABLE IF NOT EXISTS forms(form_id, lexeme_id, language, value, grammaticalFeatures, 
+        CONSTRAINT pk_forms PRIMARY KEY (form_id, language),
+        CONSTRAINT fk_forms FOREIGN KEY (lexeme_id) REFERENCES lexeme (lexeme_id))
+    """
     )
+
+    # Senses are descriptions
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS senses(sense_id, lexeme_id, language, value, 
+        CONSTRAINT pk_senses PRIMARY KEY (sense_id, language),
+        CONSTRAINT fk_senses FOREIGN KEY (lexeme_id) REFERENCES lexeme (lexeme_id))
+    """
+    )
+
     # Claims are different representation and explanation of the lexeme like hyphenation, TODO
     cur.execute(
-        "CREATE TABLE IF NOT EXISTS lexeme_claims(claim_id, lexeme_id, property, datatype, value)"
+        """
+        CREATE TABLE IF NOT EXISTS claims(claim_id, parent_id, property_id, datatype, value,
+        CONSTRAINT pk_claims PRIMARY KEY (claim_id),
+        CONSTRAINT fk_properties FOREIGN KEY (property_id) REFERENCES properties (property_id))
+    """
     )
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS forms_claims(claim_id, form_id, property, datatype, value)"
-    )
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS senses_claims(claim_id, sense_id, property, datatype, value)"
-    )
-    # Senses are descriptions
-    cur.execute("CREATE TABLE IF NOT EXISTS senses(sense_id, lexeme_id, language, value)")
     return con
 
 
-def parse_line(con, line_number: int, line: str):
+def parse_properties(con, decoder, line: str):
+    cur = con.cursor()
+    result = decoder.decode(line)
+
+    for prop in result:
+        try:
+            property_id = prop["property"].split("/")[-1]
+            cur.execute(
+                "INSERT INTO properties VALUES (?, ?, ?)",
+                (
+                    property_id,
+                    prop["propertyLabel"],
+                    prop.get("propertyDescription"),
+                ),
+            )
+        except Exception as ex:
+            logger.exception(prop)
+            raise ex
+
+
+def parse_lexeme_line(con, decoder, line_number: int, line: str):
     """
     Remove ",\n" at the end of each line to process the file as jsonlines
     This way the whole file does not have to be loaded in memory
     """
     if line.endswith(",\n"):
-        result = msgspec.json.decode(line[:-2])
+        result = decoder.decode(line[:-2])
     else:
-        result = msgspec.json.decode(line)
+        result = decoder.decode(line)
     try:
         save(con, line_number, result)
     except Exception as ex:
@@ -105,7 +155,7 @@ def save(con, line_number: int, result: Dict):
     # Save line
     save_lexeme(cur, line_number, result)
     save_lemmas(cur, line_number, result)
-    save_claims(cur, line_number, result["claims"], "lexeme_claims", result["id"])
+    save_claims(cur, line_number, result["claims"], result["id"])
     save_forms(cur, line_number, result)
     save_senses(cur, line_number, result)
 
@@ -136,7 +186,7 @@ def save_lemmas(cur, line_number: int, result: Dict):
         )
 
 
-def save_claims(cur, line_number: int, claims: Dict, table: str, parent_id: str):
+def save_claims(cur, line_number: int, claims: Dict, parent_id: str):
     for m, claim in enumerate(iter(claims.values()), start=1):
         logger.debug(f"Claim n°{m} at line n°{line_number}")
 
@@ -168,7 +218,7 @@ def save_claims(cur, line_number: int, claims: Dict, table: str, parent_id: str)
                 logger.debug(f"Sub Claim n°{o} at line n°{line_number} has reference that skipped")
 
             cur.execute(
-                f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?)",
+                f"INSERT INTO claims VALUES (?, ?, ?, ?, ?)",
                 (
                     sub_claim["id"],
                     parent_id,
@@ -190,7 +240,7 @@ def save_forms(cur, line_number: int, result: Dict):
                 (form["id"], result["id"], repre["language"], repre["value"], grammatical_features),
             )
 
-        save_claims(cur, line_number, form["claims"], "forms_claims", form["id"])
+        save_claims(cur, line_number, form["claims"], form["id"])
 
 
 def save_senses(cur, line_number: int, result: Dict):
@@ -204,9 +254,13 @@ def save_senses(cur, line_number: int, result: Dict):
                 (sense["id"], result["id"], lang["language"], lang["value"]),
             )
 
-        save_claims(cur, line_number, sense["claims"], "senses_claims", sense["id"])
+        save_claims(cur, line_number, sense["claims"], sense["id"])
 
 
 if __name__ == "__main__":
+    now = time.time()
     logger.info("Start")
-    main("latest-lexemes.json", "output.db")
+    main("latest-lexemes.json", "properties.json", "output.db")
+    then = time.time()
+    elapse = round(then - now, 3)
+    logger.info(f"Took: {elapse} s")
